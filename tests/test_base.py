@@ -11,13 +11,7 @@ class TestTool(BaseTool):
         return ToolResult(success=True, output=f"Got: {message}")
 
     def get_input_schema(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "message": {"type": "string"}
-            },
-            "required": ["message"]
-        }
+        return {"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]}
 
 
 def test_tool_run():

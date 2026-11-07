@@ -1,21 +1,17 @@
 """Tests for all agent tools: calculator, code_executor, file_tool, web_search."""
 
-import os
-import shutil
-from pathlib import Path
-
 import pytest
 
 from tools.base import ToolResult
 from tools.calculator import CalculatorTool
 from tools.code_executor import CodeExecutorTool
-from tools.file_tool import FileTool, _WORKSPACE
+from tools.file_tool import FileTool
 from tools.web_search import WebSearchTool
-
 
 # ──────────────────────────────────────────────────────────────────────
 # Calculator Tool Tests
 # ──────────────────────────────────────────────────────────────────────
+
 
 class TestCalculatorTool:
     """Unit tests for CalculatorTool."""
@@ -115,6 +111,7 @@ class TestCalculatorTool:
 # Code Executor Tool Tests
 # ──────────────────────────────────────────────────────────────────────
 
+
 class TestCodeExecutorTool:
     """Unit tests for CodeExecutorTool."""
 
@@ -165,6 +162,16 @@ print(f"Sum: {total}")
         assert schema["name"] == "code_executor"
         assert "code" in schema["input_schema"]["properties"]
 
+    def test_parent_environment_not_inherited(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-not-leak")
+        result = self.tool.run(code="import os; print(os.environ.get('ANTHROPIC_API_KEY'))")
+        assert result.output["stdout"] == "None"
+
+    def test_app_dependencies_not_importable(self):
+        result = self.tool.run(code="import anthropic")
+        assert result.success is False
+        assert "ModuleNotFoundError" in result.error
+
     @pytest.mark.slow
     def test_timeout(self):
         """Code that runs too long should time out."""
@@ -177,22 +184,14 @@ print(f"Sum: {total}")
 # File Tool Tests
 # ──────────────────────────────────────────────────────────────────────
 
+
 class TestFileTool:
-    """Unit tests for FileTool."""
+    """Unit tests for FileTool (each test gets its own temporary workspace)."""
 
-    def setup_method(self):
-        self.tool = FileTool()
-        # Ensure workspace exists and is clean for tests
-        _WORKSPACE.mkdir(parents=True, exist_ok=True)
-
-    def teardown_method(self):
-        # Clean up test files
-        test_dir = _WORKSPACE / "test_subdir"
-        if test_dir.exists():
-            shutil.rmtree(test_dir)
-        test_file = _WORKSPACE / "test_file.txt"
-        if test_file.exists():
-            test_file.unlink()
+    @pytest.fixture(autouse=True)
+    def _workspace(self, tmp_path):
+        self.workspace = tmp_path / "ws"
+        self.tool = FileTool(workspace=self.workspace)
 
     def test_write_and_read(self):
         # Write
@@ -211,9 +210,7 @@ class TestFileTool:
             content="nested content",
         )
         assert result.success is True
-        assert (
-            _WORKSPACE / "test_subdir" / "nested" / "file.txt"
-        ).exists()
+        assert (self.workspace / "test_subdir" / "nested" / "file.txt").exists()
 
     def test_read_nonexistent_file(self):
         result = self.tool.run(action="read", path="nonexistent_file.txt")
@@ -240,6 +237,22 @@ class TestFileTool:
         result = self.tool.run(action="read", path="/etc/passwd")
         assert result.success is False
 
+    def test_sibling_directory_with_same_prefix_blocked(self):
+        """A string-prefix check would let `<ws>-evil` through; is_relative_to doesn't."""
+        sibling = self.workspace.parent / (self.workspace.name + "-evil")
+        sibling.mkdir()
+        (sibling / "secret.txt").write_text("nope")
+        result = self.tool.run(action="read", path=str(sibling / "secret.txt"))
+        assert result.success is False
+        assert "access denied" in result.error.lower()
+
+    def test_symlink_escape_blocked(self, tmp_path):
+        outside = tmp_path / "outside.txt"
+        outside.write_text("secret")
+        (self.workspace / "link.txt").symlink_to(outside)
+        result = self.tool.run(action="read", path="link.txt")
+        assert result.success is False
+
     def test_schema(self):
         schema = self.tool.to_schema()
         assert schema["name"] == "file_tool"
@@ -250,6 +263,7 @@ class TestFileTool:
 # ──────────────────────────────────────────────────────────────────────
 # Web Search Tool Tests
 # ──────────────────────────────────────────────────────────────────────
+
 
 class TestWebSearchTool:
     """Unit tests for WebSearchTool."""
