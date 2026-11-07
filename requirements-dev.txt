@@ -4,5 +4,5 @@ pytest-asyncio>=0.24
 pytest-cov>=6.0
 fakeredis>=2.26
 aiosqlite>=0.20
-ruff>=0.8
+ruff>=0.17.3
 pre-commit>=4.0
