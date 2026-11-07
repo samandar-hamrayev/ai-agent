@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, Protocol
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, select, text
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
+
+from agent.usage import Usage
 
 
 def _now() -> datetime:
@@ -31,6 +34,11 @@ class Run(Base):
     status: Mapped[str] = mapped_column(String(20), default="running")  # running | completed | failed
     final_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    cache_read_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    cache_write_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    cost_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"), server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -48,6 +56,7 @@ class Step(Base):
     thought: Mapped[str | None] = mapped_column(Text, nullable=True)
     actions: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     is_final: Mapped[bool] = mapped_column(Boolean, default=False)
+    usage: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     run: Mapped[Run] = relationship(back_populates="steps")
@@ -56,7 +65,9 @@ class Step(Base):
 class RunStore(Protocol):
     async def start_run(self, run_id: str, session_id: str, goal: str) -> None: ...
     async def add_step(self, run_id: str, step: dict[str, Any]) -> None: ...
-    async def finish_run(self, run_id: str, status: str, final_answer: str | None, model: str | None) -> None: ...
+    async def finish_run(
+        self, run_id: str, status: str, final_answer: str | None, model: str | None, usage: Usage | None = None
+    ) -> None: ...
 
 
 class NullRunStore:
@@ -68,7 +79,9 @@ class NullRunStore:
     async def add_step(self, run_id: str, step: dict[str, Any]) -> None:
         return None
 
-    async def finish_run(self, run_id: str, status: str, final_answer: str | None, model: str | None) -> None:
+    async def finish_run(
+        self, run_id: str, status: str, final_answer: str | None, model: str | None, usage: Usage | None = None
+    ) -> None:
         return None
 
 
@@ -104,10 +117,13 @@ class SqlRunStore:
                     thought=step.get("thought"),
                     actions=step.get("actions", []),
                     is_final=step.get("is_final", False),
+                    usage=step.get("usage"),
                 )
             )
 
-    async def finish_run(self, run_id: str, status: str, final_answer: str | None, model: str | None) -> None:
+    async def finish_run(
+        self, run_id: str, status: str, final_answer: str | None, model: str | None, usage: Usage | None = None
+    ) -> None:
         async with self._sessions.begin() as db:
             run = await db.get(Run, run_id)
             if run is None:
@@ -116,6 +132,12 @@ class SqlRunStore:
             run.final_answer = final_answer
             run.model = model
             run.finished_at = _now()
+            if usage is not None:
+                run.input_tokens = usage.input_tokens
+                run.output_tokens = usage.output_tokens
+                run.cache_read_tokens = usage.cache_read_tokens
+                run.cache_write_tokens = usage.cache_write_tokens
+                run.cost_usd = usage.cost_usd
 
     async def get_run(self, run_id: str) -> Run | None:
         async with self._sessions() as db:
