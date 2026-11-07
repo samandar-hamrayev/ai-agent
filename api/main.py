@@ -19,13 +19,15 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from sse_starlette.sse import EventSourceResponse
 
+from agent.approvals import ApprovalDecision, RedisApprovalGate
 from agent.config import Settings, get_settings
-from agent.core import Agent, AgentConfig, AgentStep
+from agent.core import Agent, AgentConfig, AgentStep, ApprovalRequest, TextChunk
 from agent.memory import LongTermMemory, ShortTermMemory
 from agent.planner import Planner
 from agent.storage import SqlRunStore
 from agent.tool_router import ToolRegistry
-from tools import CalculatorTool, CodeExecutorTool, FileTool, WebSearchTool
+from agent.usage import Usage
+from tools import CalculatorTool, CodeExecutorTool, FileTool, WebFetchTool, WebSearchTool
 
 logger = logging.getLogger(__name__)
 
@@ -38,12 +40,14 @@ class Services:
     redis: Redis
     short_term: ShortTermMemory
     store: SqlRunStore | None = None
+    approvals: RedisApprovalGate | None = None
 
 
 def build_registry(settings: Settings) -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(CalculatorTool())
     registry.register(WebSearchTool())
+    registry.register(WebFetchTool())
     registry.register(FileTool(workspace=settings.workspace_dir))
     if settings.enable_code_executor:
         registry.register(CodeExecutorTool())
@@ -57,6 +61,7 @@ async def build_services(settings: Settings) -> Services:
     settings.chromadb_path.mkdir(parents=True, exist_ok=True)
     long_term = LongTermMemory(persist_directory=settings.chromadb_path)
     store = SqlRunStore.from_url(settings.database_url) if settings.database_url else None
+    approvals = RedisApprovalGate(redis) if settings.require_approval else None
 
     if not settings.anthropic_api_key.get_secret_value():
         logger.warning("ANTHROPIC_API_KEY is not set — the agent won't be able to call Claude.")
@@ -73,9 +78,15 @@ async def build_services(settings: Settings) -> Services:
         long_term_memory=long_term,
         planner=planner,
         run_store=store,
-        config=AgentConfig(max_iterations=settings.max_iterations, save_to_long_term=settings.save_to_long_term),
+        config=AgentConfig(
+            max_iterations=settings.max_iterations,
+            save_to_long_term=settings.save_to_long_term,
+            require_approval=settings.require_approval,
+            approval_timeout_seconds=settings.approval_timeout_seconds,
+        ),
+        approval_gate=approvals,
     )
-    return Services(agent=agent, redis=redis, short_term=short_term, store=store)
+    return Services(agent=agent, redis=redis, short_term=short_term, store=store, approvals=approvals)
 
 
 # --- Request / response schemas ---
@@ -104,6 +115,16 @@ class StepOut(BaseModel):
     thought: str | None
     actions: list[dict[str, Any]]
     is_final: bool
+    usage: dict[str, Any] | None = None
+
+
+class UsageOut(BaseModel):
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    cache_hit_rate: float
+    cost_usd: str
 
 
 class RunOut(BaseModel):
@@ -113,12 +134,25 @@ class RunOut(BaseModel):
     status: str
     final_answer: str | None
     model: str | None
+    usage: UsageOut
     created_at: str
     finished_at: str | None
     steps: list[StepOut] = []
 
 
+class ApprovalIn(BaseModel):
+    approve: bool
+    reason: str | None = Field(default=None, max_length=500)
+
+
 def _run_out(run: Any, with_steps: bool = False) -> RunOut:
+    usage = Usage(
+        input_tokens=run.input_tokens,
+        output_tokens=run.output_tokens,
+        cache_read_tokens=run.cache_read_tokens,
+        cache_write_tokens=run.cache_write_tokens,
+        cost_usd=run.cost_usd,
+    )
     return RunOut(
         id=run.id,
         session_id=run.session_id,
@@ -126,10 +160,18 @@ def _run_out(run: Any, with_steps: bool = False) -> RunOut:
         status=run.status,
         final_answer=run.final_answer,
         model=run.model,
+        usage=UsageOut(
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_read_tokens=usage.cache_read_tokens,
+            cache_write_tokens=usage.cache_write_tokens,
+            cache_hit_rate=usage.cache_hit_rate,
+            cost_usd=f"{usage.cost_usd:.6f}",
+        ),
         created_at=run.created_at.isoformat(),
         finished_at=run.finished_at.isoformat() if run.finished_at else None,
         steps=[
-            StepOut(step_number=s.step_number, thought=s.thought, actions=s.actions, is_final=s.is_final)
+            StepOut(step_number=s.step_number, thought=s.thought, actions=s.actions, is_final=s.is_final, usage=s.usage)
             for s in run.steps
         ]
         if with_steps
@@ -206,7 +248,7 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
     app = FastAPI(
         title="AI Agent API",
         description="Autonomous ReAct agent on the Claude API: tool use, Redis + ChromaDB memory, SSE streaming.",
-        version="2.0.0",
+        version="2.1.0",
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -223,21 +265,44 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
 
     @app.post("/run", dependencies=[Depends(rate_limit)])
     async def run_agent(body: RunRequest, services: ServicesDep) -> EventSourceResponse:
-        """Stream the agent's reasoning as Server-Sent Events: run_started → step* → final | error."""
+        """Stream a run as Server-Sent Events.
+
+        run_started → (text* · approval_required* · step)* → final | error
+        """
         session_id = body.session_id or str(uuid.uuid4())
         run_id = str(uuid.uuid4())
+
+        def sse(event: TextChunk | ApprovalRequest | AgentStep) -> dict[str, str]:
+            name = event.type
+            if isinstance(event, AgentStep):
+                name = "final" if event.is_final else "step"
+            return {"event": name, "data": event.model_dump_json()}
 
         async def stream() -> AsyncGenerator[dict[str, str], None]:
             yield {"event": "run_started", "data": json.dumps({"run_id": run_id, "session_id": session_id})}
             try:
-                async for step in services.agent.run(body.goal, session_id=session_id, run_id=run_id):
-                    yield {"event": "final" if step.is_final else "step", "data": step.model_dump_json()}
+                async for event in services.agent.run(body.goal, session_id=session_id, run_id=run_id):
+                    yield sse(event)
             except Exception:
                 logger.exception("Run %s failed", run_id)
                 error = AgentStep(run_id=run_id, step_number=0, is_final=True, final_answer="Internal error.")
                 yield {"event": "error", "data": error.model_dump_json()}
 
-        return EventSourceResponse(stream())
+        # Pings keep the connection open through proxies while a run waits for an approval.
+        return EventSourceResponse(stream(), ping=15)
+
+    @app.post(
+        "/runs/{run_id}/approvals/{tool_use_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+        dependencies=[Authorized],
+    )
+    async def decide_approval(run_id: str, tool_use_id: str, body: ApprovalIn, services: ServicesDep) -> None:
+        """Approve or deny a pending tool call. Each pending call accepts exactly one decision."""
+        if services.approvals is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Approvals are disabled (REQUIRE_APPROVAL=false).")
+        decision = ApprovalDecision(decision="approved" if body.approve else "denied", reason=body.reason)
+        if not await services.approvals.submit(run_id, tool_use_id, decision):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "No pending approval for this tool call.")
 
     @app.get("/runs", response_model=list[RunOut], dependencies=[Authorized])
     async def list_runs(

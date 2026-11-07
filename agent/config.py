@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     workspace_dir: Path = Path("./data/workspace")
     # Off by default: the child runs as the same OS user as the API (see README, "Security model").
     enable_code_executor: bool = False
+    # Pause for a human decision before side-effecting tool calls (file writes, code execution).
+    require_approval: bool = True
+    approval_timeout_seconds: int = Field(default=300, ge=5, le=3600)
 
     # API
     api_key: SecretStr | None = None  # if set, every request must send X-API-Key

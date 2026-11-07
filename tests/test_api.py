@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -25,10 +26,10 @@ def parse_sse(body: str) -> list[tuple[str, dict]]:
 
 
 @pytest.fixture
-def client_factory(make_agent, redis, stm, store):
+def client_factory(make_agent, redis, stm, store, gate):
     async def _make(turns, **settings_overrides):
         settings = Settings(_env_file=None, **{"rate_limit_per_minute": 100, **settings_overrides})
-        services = Services(agent=make_agent(turns), redis=redis, short_term=stm, store=store)
+        services = Services(agent=make_agent(turns), redis=redis, short_term=stm, store=store, approvals=gate)
         app = create_app(settings, services)
         app.state.services = services  # ASGITransport doesn't run lifespan
         transport = httpx.ASGITransport(app=app)
@@ -43,13 +44,20 @@ async def test_run_streams_steps_and_persists(client_factory):
         assert res.status_code == 200
         events = parse_sse(res.text)
 
-        assert [e for e, _ in events] == ["run_started", "step", "final"]
+        names = [e for e, _ in events]
+        assert names == ["run_started", "step", "text", "final"]
         run_id = events[0][1]["run_id"]
         assert events[1][1]["actions"][0]["tool_name"] == "echo"
-        assert events[2][1]["final_answer"] == "done"
+        assert events[2][1]["text"].strip() == "done"
+        final = events[3][1]
+        assert final["final_answer"] == "done"
+        assert final["run_usage"]["input_tokens"] == 2000
 
         run = (await client.get(f"/runs/{run_id}")).json()
         assert run["status"] == "completed"
+        assert run["usage"]["input_tokens"] == 2000
+        assert run["usage"]["cache_hit_rate"] == 0.8
+        assert float(run["usage"]["cost_usd"]) > 0
         assert [s["step_number"] for s in run["steps"]] == [1, 2]
 
         listed = (await client.get("/runs", params={"session_id": "demo"})).json()
@@ -84,9 +92,9 @@ async def test_validation(client_factory):
 async def test_health_and_tools(client_factory):
     async with await client_factory([]) as client:
         health = (await client.get("/health")).json()
-        assert health == {"status": "ok", "redis": True, "database": True, "tools": ["boom", "echo"]}
+        assert health == {"status": "ok", "redis": True, "database": True, "tools": ["boom", "echo", "writer"]}
         tools = (await client.get("/tools")).json()
-        assert {t["name"] for t in tools} == {"boom", "echo"}
+        assert {t["name"] for t in tools} == {"boom", "echo", "writer"}
 
 
 async def test_clear_session(client_factory, stm):
@@ -101,3 +109,50 @@ async def test_demo_page(client_factory):
         res = await client.get("/")
         assert res.status_code == 200
         assert "ReAct" in res.text
+
+
+async def test_approval_flow_over_http(client_factory, redis):
+    turns = [tool_turn(("w1", "writer", {"text": "hello"})), text_turn("written")]
+    async with await client_factory(turns) as client:
+
+        async def approve_when_pending():
+            for _ in range(200):
+                keys = await redis.keys("agent:approval:*:w1:pending")
+                if keys:
+                    run_id = keys[0].split(":")[2]
+                    res = await client.post(f"/runs/{run_id}/approvals/w1", json={"approve": True})
+                    assert res.status_code == 204
+                    again = await client.post(f"/runs/{run_id}/approvals/w1", json={"approve": False})
+                    assert again.status_code == 404  # single use
+                    return
+                await asyncio.sleep(0.01)
+            raise AssertionError("approval was never requested")
+
+        approver = asyncio.create_task(approve_when_pending())
+        res = await client.post("/run", json={"goal": "write"})
+        await approver
+
+        events = parse_sse(res.text)
+        names = [e for e, _ in events]
+        assert "approval_required" in names
+        request = dict(events)["approval_required"]
+        assert request["tool_name"] == "writer" and request["tool_input"] == {"text": "hello"}
+        step = dict(events)["step"]
+        assert step["actions"][0]["approval"] == "approved"
+
+
+async def test_unknown_approval_is_404(client_factory):
+    async with await client_factory([]) as client:
+        res = await client.post("/runs/r/approvals/t", json={"approve": True})
+        assert res.status_code == 404
+
+
+async def test_approvals_disabled(client_factory, make_agent, redis, stm, store):
+    settings = Settings(_env_file=None, require_approval=False)
+    services = Services(agent=make_agent([]), redis=redis, short_term=stm, store=store, approvals=None)
+    app = create_app(settings, services)
+    app.state.services = services
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        res = await client.post("/runs/r/approvals/t", json={"approve": True})
+        assert res.status_code == 404
+        assert "disabled" in res.json()["detail"]
