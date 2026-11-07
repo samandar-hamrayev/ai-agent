@@ -1,6 +1,6 @@
 [project]
 name = "ai-agent"
-version = "2.0.0"
+version = "2.1.0"
 description = "Autonomous ReAct agent built from scratch on the Claude API"
 requires-python = ">=3.12"
 license = "MIT"
@@ -17,7 +17,7 @@ markers = [
 filterwarnings = ["ignore::DeprecationWarning:chromadb.*"]
 
 [tool.coverage.run]
-source = ["agent", "api", "tools"]
+source = ["agent", "api", "tools", "evals"]
 branch = true
 
 [tool.coverage.report]

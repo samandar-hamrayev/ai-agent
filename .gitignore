@@ -23,3 +23,6 @@ TZ.md
 .DS_Store
 .idea/
 .vscode/
+
+# Eval outputs
+evals/results/
