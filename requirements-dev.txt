@@ -5,4 +5,4 @@ pytest-cov>=6.0
 fakeredis>=2.26
 aiosqlite>=0.20
 ruff>=0.8
-pre-commit>=4.0
+pre-commit>=4.7.0
