@@ -1,145 +1,146 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import date
 from typing import Any
 
 import anthropic
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = """You are an autonomous AI Agent with access to tools.
-Your task is to help the user achieve their goal by reasoning step-by-step and using tools when needed.
+# Kept free of per-request values (session ids, timestamps) so the prefix stays cacheable.
+_SYSTEM_PROMPT = """You are an autonomous agent that solves the user's goal step by step.
 
-## Your Approach (ReAct Pattern)
-1. THINK — Analyze what needs to be done next
-2. DECIDE — Choose which tool to use (or provide the final answer)
-3. ACT — Use the selected tool
-4. OBSERVE — Review the tool's result
-5. REPEAT — Continue until the goal is fully achieved
+Work in a loop: reason about what is still unknown, call a tool when it gets you closer \
+to the answer, read the result, and repeat. Answer directly when you already know enough.
 
-## Rules
-- Always think before acting. Explain your reasoning.
-- Use tools only when necessary — if you already know the answer, respond directly.
-- If a tool fails, acknowledge the error and try an alternative approach.
-- Provide clear, structured final answers.
-- Be concise but thorough.
+- If a tool fails, read the error and try a different approach instead of repeating the same call.
+- Independent tool calls can be made in parallel in a single turn.
+- Finish with a clear, well-structured answer for the user.
 
-## Available Tools
-{tool_descriptions}
+Today's date: {today}
 
-## Current Context
-- Date/Time: {current_datetime}
-- Session: {session_id}
+{memory_context}"""
 
-## Relevant Memory
-{memory_context}
-"""
+_FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 
-class PlannerResponse:
-    """Parsed Claude API response — either a text reply or a tool call."""
+class ToolCall(BaseModel):
+    id: str
+    name: str
+    input: dict[str, Any] = Field(default_factory=dict)
 
-    def __init__(
-        self,
-        response_type: str,
-        text: str | None = None,
-        tool_name: str | None = None,
-        tool_input: dict[str, Any] | None = None,
-        tool_use_id: str | None = None,
-        stop_reason: str | None = None,
-    ) -> None:
-        self.response_type = response_type
-        self.text = text
-        self.tool_name = tool_name
-        self.tool_input = tool_input
-        self.tool_use_id = tool_use_id
-        self.stop_reason = stop_reason
+
+class PlannerResponse(BaseModel):
+    """One parsed Claude turn: free text, zero or more tool calls, and the raw content to replay."""
+
+    text: str | None = None
+    tool_calls: list[ToolCall] = Field(default_factory=list)
+    stop_reason: str | None = None
+    # Raw assistant content blocks (thinking, text, tool_use) to append to history unchanged.
+    content: list[dict[str, Any]] = Field(default_factory=list)
+    model: str | None = None
+    error: str | None = None
 
     @property
     def wants_tool(self) -> bool:
-        return self.response_type == "tool_use" and self.tool_name is not None
+        return bool(self.tool_calls)
 
     @property
-    def is_final(self) -> bool:
-        return self.stop_reason == "end_turn" and not self.wants_tool
-
-    def __repr__(self) -> str:
-        if self.wants_tool:
-            return f"PlannerResponse(tool_use: {self.tool_name})"
-        return f"PlannerResponse(text: {(self.text or '')[:80]}...)"
+    def refused(self) -> bool:
+        return self.stop_reason == "refusal"
 
 
 class Planner:
-    """Handles all Claude API interactions — prompt building and response parsing."""
+    """Owns every Claude API call: prompt assembly, request options and response parsing."""
 
-    def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514", max_tokens: int = 4096) -> None:
-        self._client = anthropic.Anthropic(api_key=api_key)
-        self._model = model
-        self._max_tokens = max_tokens
-        logger.info("Planner ready: model=%s", model)
-
-    def _build_system_prompt(self, tool_schemas: list[dict], session_id: str, memory_context: str = "") -> str:
-        tool_descriptions = "\n".join(f"- **{t['name']}**: {t['description']}" for t in tool_schemas)
-        return _SYSTEM_PROMPT.format(
-            tool_descriptions=tool_descriptions or "(no tools available)",
-            current_datetime=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-            session_id=session_id,
-            memory_context=memory_context or "(no relevant memory)",
-        )
-
-    def think(
+    def __init__(
         self,
-        messages: list[dict],
-        tool_schemas: list[dict],
-        session_id: str = "default",
-        memory_context: str = "",
-    ) -> PlannerResponse:
-        """Send conversation + tools to Claude, get back a decision."""
-        system = self._build_system_prompt(tool_schemas, session_id, memory_context)
+        client: anthropic.AsyncAnthropic,
+        model: str,
+        effort: str = "high",
+        max_tokens: int = 16_000,
+        fallbacks: bool = True,
+    ) -> None:
+        self._client = client
+        self._model = model
+        self._effort = effort
+        self._max_tokens = max_tokens
+        self._fallbacks = fallbacks
+        logger.info("Planner ready: model=%s effort=%s fallbacks=%s", model, effort, fallbacks)
 
-        kwargs: dict[str, Any] = {
+    def build_system_prompt(self, memory_context: str = "") -> str:
+        return _SYSTEM_PROMPT.format(
+            today=date.today().isoformat(),
+            memory_context=memory_context or "No relevant memories from earlier sessions.",
+        ).strip()
+
+    def build_request(
+        self, messages: list[dict[str, Any]], tool_schemas: list[dict[str, Any]], memory_context: str = ""
+    ) -> dict[str, Any]:
+        request: dict[str, Any] = {
             "model": self._model,
             "max_tokens": self._max_tokens,
-            "system": system,
+            "system": [
+                {
+                    "type": "text",
+                    "text": self.build_system_prompt(memory_context),
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
             "messages": messages,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": self._effort},
         }
         if tool_schemas:
-            kwargs["tools"] = tool_schemas
+            request["tools"] = tool_schemas
+        if self._fallbacks:
+            request["betas"] = [_FALLBACK_BETA]
+            request["fallbacks"] = "default"
+        return request
 
+    async def think(
+        self,
+        messages: list[dict[str, Any]],
+        tool_schemas: list[dict[str, Any]],
+        memory_context: str = "",
+    ) -> PlannerResponse:
+        """Send the conversation and tool list to Claude and parse its decision."""
+        request = self.build_request(messages, tool_schemas, memory_context)
         try:
-            response = self._client.messages.create(**kwargs)
-        except anthropic.APIError as e:
-            logger.error("Claude API error: %s", e)
-            return PlannerResponse(
-                response_type="text",
-                text=f"API error: {e}. Please try again.",
-                stop_reason="error",
-            )
+            response = await self._client.beta.messages.create(**request)
+        except anthropic.RateLimitError as e:
+            logger.warning("Claude rate limit: %s", e)
+            return PlannerResponse(stop_reason="error", error="Claude API rate limit reached, try again shortly.")
+        except anthropic.APIStatusError as e:
+            logger.error("Claude API error %s: %s", e.status_code, e.message)
+            return PlannerResponse(stop_reason="error", error=f"Claude API error ({e.status_code}).")
+        except anthropic.APIConnectionError as e:
+            logger.error("Claude connection error: %s", e)
+            return PlannerResponse(stop_reason="error", error="Could not reach the Claude API.")
+        return self.parse(response)
 
-        return self._parse(response)
-
-    def _parse(self, response: Any) -> PlannerResponse:
-        """Extract text and tool_use blocks from a Claude response."""
+    @staticmethod
+    def parse(response: Any) -> PlannerResponse:
+        """Split a Messages API response into text, tool calls and replayable content."""
         text_parts: list[str] = []
-        tool_block = None
+        tool_calls: list[ToolCall] = []
+        content: list[dict[str, Any]] = []
 
         for block in response.content:
+            if block.type == "fallback":  # audit marker only, not part of the conversation
+                continue
+            content.append(block.model_dump(mode="json", exclude_none=True))
             if block.type == "text":
                 text_parts.append(block.text)
             elif block.type == "tool_use":
-                tool_block = block
+                tool_calls.append(ToolCall(id=block.id, name=block.name, input=dict(block.input or {})))
 
-        text = "\n".join(text_parts) if text_parts else None
-
-        if tool_block:
-            return PlannerResponse(
-                response_type="tool_use",
-                text=text,
-                tool_name=tool_block.name,
-                tool_input=dict(tool_block.input) if tool_block.input else {},
-                tool_use_id=tool_block.id,
-                stop_reason=response.stop_reason,
-            )
-
-        return PlannerResponse(response_type="text", text=text, stop_reason=response.stop_reason)
+        return PlannerResponse(
+            text="\n".join(text_parts) or None,
+            tool_calls=tool_calls,
+            stop_reason=response.stop_reason,
+            content=content,
+            model=getattr(response, "model", None),
+        )
