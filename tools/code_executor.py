@@ -46,6 +46,7 @@ class CodeExecutorTool(BaseTool):
     """
 
     name: str = "code_executor"
+    requires_approval: bool = True
     description: str = (
         "Executes a self-contained Python 3 script (standard library only) and returns stdout/stderr. "
         "Limits: 10 seconds, 512 MB of memory, no third-party packages. "

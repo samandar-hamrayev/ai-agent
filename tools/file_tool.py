@@ -32,6 +32,10 @@ class FileTool(BaseTool):
         "All paths are restricted to the workspace directory for security."
     )
 
+    def needs_approval(self, tool_input: dict) -> bool:
+        """Reading is harmless; writing changes state, so a human signs off on it."""
+        return tool_input.get("action") == "write"
+
     def __init__(self, workspace: Path = _DEFAULT_WORKSPACE) -> None:
         self.workspace = workspace
         self.workspace.mkdir(parents=True, exist_ok=True)

@@ -22,6 +22,8 @@ class BaseTool(ABC):
 
     name: str
     description: str
+    # Side-effecting tools set this; the agent then pauses for a human decision before running them.
+    requires_approval: bool = False
 
     @abstractmethod
     def run(self, **kwargs) -> ToolResult:
@@ -40,6 +42,10 @@ class BaseTool(ABC):
     def get_input_schema(self) -> dict:
         """Return JSON Schema describing accepted parameters."""
         pass
+
+    def needs_approval(self, tool_input: dict[str, Any]) -> bool:
+        """Whether this particular call must be approved. Override for per-input rules."""
+        return self.requires_approval
 
     def safe_run(self, **kwargs) -> ToolResult:
         """Wrap run() in try/except so the agent never crashes."""

@@ -4,6 +4,8 @@ import asyncio
 import logging
 from typing import Any
 
+from jsonschema import Draft202012Validator
+
 from tools.base import BaseTool, ToolResult
 
 logger = logging.getLogger(__name__)
@@ -14,12 +16,37 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, BaseTool] = {}
+        self._validators: dict[str, Draft202012Validator] = {}
 
     def register(self, tool: BaseTool) -> None:
         if tool.name in self._tools:
             raise ValueError(f"Tool '{tool.name}' is already registered.")
+        schema = tool.get_input_schema()
+        Draft202012Validator.check_schema(schema)
         self._tools[tool.name] = tool
+        self._validators[tool.name] = Draft202012Validator(schema)
         logger.info("Registered tool: %s", tool.name)
+
+    def validate(self, tool_name: str, input_data: Any) -> str | None:
+        """Return an error message if the input doesn't match the tool's schema, else None.
+
+        Tool inputs stream eagerly, so the API doesn't validate them — a truncated or
+        malformed call must be rejected here, before anything runs.
+        """
+        if not isinstance(input_data, dict):
+            return f"Tool input must be a JSON object, got {type(input_data).__name__}."
+        validator = self._validators.get(tool_name)
+        if validator is None:
+            return None
+        errors = sorted(validator.iter_errors(input_data), key=lambda e: list(e.path))
+        if not errors:
+            return None
+        details = "; ".join(f"{'/'.join(map(str, e.path)) or '(root)'}: {e.message}" for e in errors[:3])
+        return f"Invalid input for '{tool_name}': {details}"
+
+    def needs_approval(self, tool_name: str, input_data: dict[str, Any]) -> bool:
+        tool = self._tools.get(tool_name)
+        return bool(tool and tool.needs_approval(input_data))
 
     def get(self, tool_name: str) -> BaseTool | None:
         return self._tools.get(tool_name)
@@ -30,6 +57,9 @@ class ToolRegistry:
         if tool is None:
             available = ", ".join(sorted(self._tools)) or "(none)"
             return ToolResult(success=False, output=None, error=f"Tool '{tool_name}' not found. Available: {available}")
+
+        if error := self.validate(tool_name, input_data):
+            return ToolResult(success=False, output=None, error=error)
 
         logger.info("Executing tool: %s", tool_name)
         result = tool.safe_run(**input_data)
