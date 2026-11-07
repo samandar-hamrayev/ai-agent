@@ -1,6 +1,40 @@
+[project]
+name = "ai-agent"
+version = "2.0.0"
+description = "Autonomous ReAct agent built from scratch on the Claude API"
+requires-python = ">=3.12"
+license = "MIT"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-ra"
 markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
-    "network: marks tests that require network access (deselect with '-m \"not network\"')",
+    "slow: slow tests (ChromaDB embeddings, timeouts) — deselect with -m 'not slow'",
+    "network: tests that hit the internet — deselect with -m 'not network'",
 ]
+filterwarnings = ["ignore::DeprecationWarning:chromadb.*"]
+
+[tool.coverage.run]
+source = ["agent", "api", "tools"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "ASYNC", "S", "RUF"]
+ignore = [
+    "S603",  # subprocess without shell — the code executor's whole purpose
+    "RUF001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S108"]

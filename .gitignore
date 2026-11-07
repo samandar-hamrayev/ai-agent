@@ -1,4 +1,25 @@
-.env
-venv/
+# Python
 __pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local config & data
+.env
+.env.*
+!.env.example
+data/
+*.db
+
+# Private notes
 TZ.md
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
