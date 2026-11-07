@@ -5,71 +5,145 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI Agent — live ReAct trace</title>
 <style>
-  :root { --bg:#0f1115; --panel:#171a21; --line:#2a2f3a; --text:#e6e8ee; --muted:#9aa3b2; --accent:#d97757; --ok:#4fb477; --err:#e5534b; }
+  :root { --bg:#0f1115; --panel:#171a21; --line:#2a2f3a; --text:#e6e8ee; --muted:#9aa3b2; --accent:#d97757; --ok:#4fb477; --err:#e5534b; --warn:#d6a243; }
   * { box-sizing:border-box; }
   body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; background:var(--bg); color:var(--text); }
-  main { max-width:860px; margin:0 auto; padding:32px 16px; }
+  main { max-width:880px; margin:0 auto; padding:32px 16px 64px; }
   h1 { font-size:22px; margin:0 0 4px; } p.sub { color:var(--muted); margin:0 0 24px; }
   form { display:flex; gap:8px; flex-wrap:wrap; }
   textarea { flex:1 1 100%; min-height:72px; padding:12px; border-radius:10px; border:1px solid var(--line); background:var(--panel); color:var(--text); font:inherit; resize:vertical; }
   input { flex:1; min-width:0; padding:10px 12px; border-radius:10px; border:1px solid var(--line); background:var(--panel); color:var(--text); font:inherit; }
-  button { padding:10px 18px; border:0; border-radius:10px; background:var(--accent); color:#fff; font-weight:600; cursor:pointer; }
-  button:disabled { opacity:.5; cursor:wait; }
+  button { padding:10px 18px; border:0; border-radius:10px; background:var(--accent); color:#fff; font-weight:600; cursor:pointer; font:inherit; }
+  button.secondary { background:transparent; border:1px solid var(--line); color:var(--text); }
+  button:disabled { opacity:.5; cursor:default; }
   #trace { margin-top:24px; display:grid; gap:12px; }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
-  .card h3 { margin:0 0 6px; font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); }
+  .card h3 { margin:0 0 6px; font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); display:flex; justify-content:space-between; gap:8px; }
+  .card h3 span.cost { text-transform:none; letter-spacing:0; }
   .card.final { border-color:var(--accent); }
-  .action { margin-top:8px; padding:10px; border-radius:8px; background:#0b0d11; font:13px/1.45 ui-monospace,Menlo,monospace; white-space:pre-wrap; word-break:break-word; }
-  .action b { color:var(--accent); } .ok { color:var(--ok); } .err { color:var(--err); }
-  .meta { color:var(--muted); font-size:12px; margin-top:16px; }
+  .card.approval { border-color:var(--warn); }
+  .thought { white-space:pre-wrap; }
+  .action { margin-top:8px; padding:10px; border-radius:8px; background:#0b0d11; font:13px/1.45 ui-monospace,Menlo,monospace; white-space:pre-wrap; word-break:break-word; max-height:260px; overflow:auto; }
+  .action b { color:var(--accent); } .ok { color:var(--ok); } .err { color:var(--err); } .warn { color:var(--warn); }
+  .row { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:8px; margin-top:16px; }
+  .tile { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
+  .tile .v { font-size:18px; font-weight:600; } .tile .k { color:var(--muted); font-size:12px; }
+  .meta { color:var(--muted); font-size:12px; margin-top:16px; word-break:break-all; }
 </style>
 </head>
 <body>
 <main>
   <h1>AI Agent</h1>
-  <p class="sub">ReAct loop on the Claude API — watch each THINK → ACT → OBSERVE step stream in over SSE.</p>
+  <p class="sub">ReAct loop on the Claude API — text streams in live, risky actions wait for your approval, every run reports its token cost.</p>
   <form id="f">
-    <textarea id="goal" required>What is 15% of the sum of the first 20 prime numbers? Show your work.</textarea>
+    <textarea id="goal" required>Find the official Python release schedule page, read it and tell me when Python 3.14 reaches end of life. Save a one-line summary to notes/python.txt.</textarea>
     <input id="session" placeholder="session id (optional, keeps conversation memory)">
     <input id="key" type="password" placeholder="X-API-Key (if the server requires one)">
     <button id="go">Run</button>
   </form>
   <div id="trace"></div>
+  <div class="tiles" id="usage" hidden></div>
   <div class="meta" id="meta"></div>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const money = (v) => "$" + Number(v || 0).toFixed(4);
+let runId = null, live = null;
 
-function render(event, data) {
+function headers() {
+  const h = { "Content-Type": "application/json" };
+  if ($("key").value) h["X-API-Key"] = $("key").value;
+  return h;
+}
+
+function card(cls, title, cost) {
+  const el = document.createElement("div");
+  el.className = "card " + cls;
+  el.innerHTML = `<h3><span>${esc(title)}</span>${cost ? `<span class="cost">${esc(cost)}</span>` : ""}</h3>`;
+  $("trace").appendChild(el);
+  return el;
+}
+
+function liveCard(step) {
+  if (!live || live.step !== step) {
+    const el = card("", `Step ${step} · thinking…`);
+    const body = document.createElement("div");
+    body.className = "thought";
+    el.appendChild(body);
+    live = { step, el, body };
+  }
+  return live;
+}
+
+function actionHtml(a) {
+  const tag = { approved: " · approved", denied: " · denied", timed_out: " · no response", invalid_input: " · invalid input" }[a.approval] || "";
+  return `<div class="action"><b>${esc(a.tool_name)}</b>(${esc(JSON.stringify(a.tool_input))})<span class="warn">${tag}</span>\n` +
+         `<span class="${a.success ? "ok" : "err"}">→ ${esc(a.result)}</span></div>`;
+}
+
+async function decide(req, approve, el) {
+  el.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  const res = await fetch(`/runs/${req.run_id}/approvals/${req.tool_use_id}`, {
+    method: "POST", headers: headers(), body: JSON.stringify({ approve }),
+  });
+  el.querySelector(".row").innerHTML = res.ok
+    ? `<span class="${approve ? "ok" : "err"}">${approve ? "Approved" : "Denied"}</span>`
+    : `<span class="err">Could not send decision (${res.status})</span>`;
+}
+
+function renderUsage(u) {
+  if (!u) return;
+  $("usage").hidden = false;
+  $("usage").innerHTML = [
+    ["Cost", money(u.cost_usd) + (u.cost_complete ? "" : "+")],
+    ["Input tokens", (u.input_tokens + u.cache_read_tokens + u.cache_write_tokens).toLocaleString()],
+    ["Output tokens", u.output_tokens.toLocaleString()],
+    ["Cache hit", Math.round(100 * u.cache_read_tokens / Math.max(1, u.input_tokens + u.cache_read_tokens + u.cache_write_tokens)) + "%"],
+  ].map(([k, v]) => `<div class="tile"><div class="v">${esc(v)}</div><div class="k">${k}</div></div>`).join("");
+}
+
+function handle(event, data) {
   if (event === "run_started") {
+    runId = data.run_id;
     $("meta").textContent = `run ${data.run_id} · session ${data.session_id}`;
     if (!$("session").value) $("session").value = data.session_id;
-    return;
+  } else if (event === "text") {
+    liveCard(data.step_number).body.textContent += data.text;
+  } else if (event === "approval_required") {
+    const el = card("approval", `Approval needed · ${data.tool_name}`);
+    el.insertAdjacentHTML("beforeend",
+      `<div class="action">${esc(JSON.stringify(data.tool_input, null, 2))}</div>
+       <div class="row"><button>Approve</button><button class="secondary">Deny</button>
+       <span class="meta">auto-denied after ${data.timeout_seconds}s</span></div>`);
+    const [yes, no] = el.querySelectorAll("button");
+    yes.onclick = () => decide(data, true, el);
+    no.onclick = () => decide(data, false, el);
+  } else if (event === "step" || event === "final" || event === "error") {
+    const cost = data.usage && data.usage.cost_usd ? money(data.usage.cost_usd) : "";
+    let el;
+    if (live && live.step === data.step_number) {
+      el = live.el;
+      el.querySelector("h3").innerHTML = `<span>${data.is_final ? "Final answer" : "Step " + data.step_number}</span>${cost ? `<span class="cost">${cost}</span>` : ""}`;
+    } else {
+      el = card("", data.is_final ? "Final answer" : `Step ${data.step_number}`, cost);
+      el.insertAdjacentHTML("beforeend", `<div class="thought">${esc(data.is_final ? data.final_answer : data.thought)}</div>`);
+    }
+    if (data.is_final) el.classList.add("final");
+    el.insertAdjacentHTML("beforeend", (data.actions || []).map(actionHtml).join(""));
+    live = null;
+    renderUsage(data.run_usage);
   }
-  const card = document.createElement("div");
-  card.className = "card" + (data.is_final ? " final" : "");
-  const title = data.is_final ? "Final answer" : `Step ${data.step_number}`;
-  let html = `<h3>${title}</h3>`;
-  if (data.is_final) html += `<div>${esc(data.final_answer).replace(/\n/g, "<br>")}</div>`;
-  else if (data.thought) html += `<div>${esc(data.thought)}</div>`;
-  for (const a of data.actions || []) {
-    html += `<div class="action"><b>${esc(a.tool_name)}</b>(${esc(JSON.stringify(a.tool_input))})\n` +
-            `<span class="${a.success ? "ok" : "err"}">→ ${esc(a.result)}</span></div>`;
-  }
-  card.innerHTML = html;
-  $("trace").appendChild(card);
 }
 
 $("f").addEventListener("submit", async (e) => {
   e.preventDefault();
-  $("trace").innerHTML = ""; $("go").disabled = true;
-  const headers = { "Content-Type": "application/json" };
-  if ($("key").value) headers["X-API-Key"] = $("key").value;
+  $("trace").innerHTML = ""; $("usage").hidden = true; $("go").disabled = true; live = null;
   const body = { goal: $("goal").value };
   if ($("session").value) body.session_id = $("session").value;
   try {
-    const res = await fetch("/run", { method: "POST", headers, body: JSON.stringify(body) });
+    const res = await fetch("/run", { method: "POST", headers: headers(), body: JSON.stringify(body) });
     if (!res.ok) throw new Error(`${res.status} ${(await res.json()).detail ?? ""}`);
     const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
     let buf = "";
@@ -82,11 +156,11 @@ $("f").addEventListener("submit", async (e) => {
         const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
         const event = (chunk.match(/^event: (.*)$/m) || [])[1];
         const data = chunk.split("\n").filter((l) => l.startsWith("data: ")).map((l) => l.slice(6)).join("\n");
-        if (event && data) render(event, JSON.parse(data));
+        if (event && data) handle(event, JSON.parse(data));
       }
     }
   } catch (err) {
-    render("error", { is_final: true, final_answer: `Request failed: ${err.message}` });
+    handle("error", { is_final: true, step_number: 0, final_answer: `Request failed: ${err.message}` });
   } finally {
     $("go").disabled = false;
   }
