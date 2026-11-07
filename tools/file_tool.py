@@ -4,44 +4,46 @@ from pathlib import Path
 
 from tools.base import BaseTool, ToolResult
 
-_WORKSPACE = Path("/tmp/agent_workspace")
+_DEFAULT_WORKSPACE = Path("./data/workspace")
 _MAX_READ = 50_000
 
 
-def _resolve_safe_path(user_path: str) -> Path:
-    """Resolve path within workspace, blocking directory traversal."""
-    _WORKSPACE.mkdir(parents=True, exist_ok=True)
+def resolve_safe_path(workspace: Path, user_path: str) -> Path:
+    """Resolve `user_path` inside `workspace`, rejecting anything that escapes it.
 
-    if Path(user_path).is_absolute():
-        resolved = Path(user_path).resolve()
-    else:
-        resolved = (_WORKSPACE / user_path).resolve()
-
-    if not str(resolved).startswith(str(_WORKSPACE.resolve())):
-        raise ValueError(
-            f"Access denied: '{user_path}' resolves outside the workspace. "
-            f"All operations are restricted to {_WORKSPACE}"
-        )
-
+    Uses `is_relative_to` on fully resolved paths: a plain string-prefix check would let
+    `/tmp/ws-evil` pass for a workspace of `/tmp/ws`, and `resolve()` follows symlinks.
+    """
+    root = workspace.resolve()
+    candidate = Path(user_path)
+    resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
+    if not resolved.is_relative_to(root):
+        raise ValueError(f"Access denied: '{user_path}' resolves outside the workspace.")
     return resolved
 
 
 class FileTool(BaseTool):
-    """Reads and writes files in a sandboxed workspace (/tmp/agent_workspace/)."""
+    """Reads and writes files inside a single workspace directory."""
 
     name: str = "file_tool"
     description: str = (
-        "Reads or writes files in the agent's workspace (/tmp/agent_workspace/). "
+        "Reads or writes text files in the agent's private workspace directory. "
         "Use action='read' to read a file, action='write' to create/overwrite a file. "
         "All paths are restricted to the workspace directory for security."
     )
 
+    def __init__(self, workspace: Path = _DEFAULT_WORKSPACE) -> None:
+        self.workspace = workspace
+        self.workspace.mkdir(parents=True, exist_ok=True)
+
     def run(self, action: str, path: str, content: str | None = None) -> ToolResult:
         if action not in ("read", "write"):
-            return ToolResult(success=False, output=None, error=f"Invalid action '{action}'. Must be 'read' or 'write'.")
+            return ToolResult(
+                success=False, output=None, error=f"Invalid action '{action}'. Must be 'read' or 'write'."
+            )
 
         try:
-            resolved = _resolve_safe_path(path)
+            resolved = resolve_safe_path(self.workspace, path)
         except ValueError as e:
             return ToolResult(success=False, output=None, error=str(e))
 
@@ -95,7 +97,7 @@ class FileTool(BaseTool):
                 },
                 "path": {
                     "type": "string",
-                    "description": "File path, relative to /tmp/agent_workspace/ or absolute within it.",
+                    "description": "File path relative to the workspace root.",
                 },
                 "content": {
                     "type": "string",

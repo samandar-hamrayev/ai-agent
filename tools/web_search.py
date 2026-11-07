@@ -44,7 +44,8 @@ def _parse_results(html: str, max_results: int = _MAX_RESULTS) -> list[dict]:
 
         title_match = re.search(
             r'<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
-            block, re.DOTALL,
+            block,
+            re.DOTALL,
         )
         if not title_match:
             continue
@@ -54,7 +55,8 @@ def _parse_results(html: str, max_results: int = _MAX_RESULTS) -> list[dict]:
 
         snippet_match = re.search(
             r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>',
-            block, re.DOTALL,
+            block,
+            re.DOTALL,
         )
         snippet = _clean_html(snippet_match.group(1)) if snippet_match else ""
 
