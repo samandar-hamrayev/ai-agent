@@ -1,329 +1,241 @@
-# 🤖 AI Agent — Autonomous ReAct Agent from Scratch
+# AI Agent — a ReAct agent built from scratch on the Claude API
 
-A **production-grade, framework-free AI Agent** built with pure Python. No LangChain, no LlamaIndex — everything is built from scratch to demonstrate deep understanding of how agentic AI systems work internally.
+[![CI](https://github.com/samandar-hamrayev/ai-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/samandar-hamrayev/ai-agent/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-SSE-009688?logo=fastapi&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+An autonomous agent that reasons, calls tools, and remembers — **without LangChain or any agent framework**.
+The loop, tool registry, memory layers, persistence and streaming API are all written by hand so every
+moving part is visible and testable.
+
+> Ask it *"What's 15% of the sum of the first 20 primes?"* and watch it plan, call `calculator` /
+> `web_search` / `file_tool`, read the results and answer — each step streamed live over Server-Sent Events.
+
+<!-- DEMO: record the built-in UI at http://localhost:8000, save it as docs/demo.gif, then replace this comment with:
+<p align="center"><img src="docs/demo.gif" alt="Live ReAct trace in the built-in demo UI" width="760"></p>
+-->
 
 ---
+
+## Why build it from scratch?
+
+Frameworks hide the parts that break in production: how tool calls are replayed, what happens when the
+history window cuts a `tool_use` away from its `tool_result`, how a blocking tool affects an async server,
+where state lives between requests. This project implements each of those explicitly:
+
+- **ReAct loop** with parallel tool calls, an iteration budget, and clean handling of refusals and API errors
+- **Two-tier memory** — Redis for the live conversation, ChromaDB for semantic recall across sessions
+- **Durable run history** in PostgreSQL (async SQLAlchemy + Alembic) — every run and step is queryable
+- **Streaming API** — FastAPI + SSE, API-key auth and a Redis-backed rate limiter
+- **Sandboxing that is honest about its limits** — path-confined file access, resource-limited code execution
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    FastAPI + SSE                         │
-│                  POST /run (stream)                      │
-└──────────────────────┬──────────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────────┐
-│                   Agent Core (ReAct Loop)                │
-│                                                          │
-│   ┌──────┐    ┌──────┐    ┌──────┐    ┌──────────┐      │
-│   │THINK │───▶│DECIDE│───▶│ ACT  │───▶│ OBSERVE  │──┐   │
-│   └──────┘    └──────┘    └──────┘    └──────────┘  │   │
-│       ▲                                              │   │
-│       └──────────────────────────────────────────────┘   │
-└───────┬────────────────┬────────────────┬───────────────┘
-        │                │                │
-        ▼                ▼                ▼
-┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-│   Planner    │ │ Tool Router  │ │    Memory     │
-│  (Claude API)│ │  (Registry)  │ │ (Redis+Chroma)│
-└──────────────┘ └──────┬───────┘ └──────────────┘
-                        │
-         ┌──────┬───────┼───────┬──────┐
-         ▼      ▼       ▼       ▼      ▼
-      ┌─────┐┌─────┐┌──────┐┌──────┐
-      │Calc ││File ││Search││ Code │
-      │     ││Tool ││      ││ Exec │
-      └─────┘└─────┘└──────┘└──────┘
+```mermaid
+flowchart LR
+    client([Client / demo UI]) -- "POST /run (SSE)" --> api
+
+    subgraph app [FastAPI service]
+        api[API layer<br/>auth · rate limit · SSE]
+        agent[Agent core<br/>ReAct loop]
+        planner[Planner<br/>Claude Messages API]
+        registry[Tool registry]
+        api --> agent
+        agent --> planner
+        agent --> registry
+    end
+
+    planner -- "tools + history" --> claude[(Claude API)]
+    registry --> tools[calculator · web_search<br/>file_tool · code_executor]
+
+    agent -- "conversation (TTL)" --> redis[(Redis)]
+    api -- "rate-limit counters" --> redis
+    agent -- "semantic recall" --> chroma[(ChromaDB)]
+    agent -- "runs & steps" --> pg[(PostgreSQL)]
 ```
 
----
+### One run, step by step
 
-## ReAct Loop — How It Works
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as Agent
+    participant M as Memory (Redis / Chroma)
+    participant L as Claude
+    participant T as Tools
 
-The agent follows the **ReAct (Reason + Act)** pattern:
-
-1. **THINK** — The LLM receives the goal + context + available tools
-2. **DECIDE** — The LLM decides which tool to use (or provide a final answer)
-3. **ACT** — The agent executes the chosen tool
-4. **OBSERVE** — The tool result is added to agent memory
-5. **REPEAT** — The loop continues until the goal is achieved
-
-### Example
-
-```
-Goal: "What is the current Bitcoin price and how much is 0.5 BTC worth?"
-
-Step 1 — THINK:  "I need to search for Bitcoin price first"
-Step 1 — ACT:    web_search(query="Bitcoin price USD")
-Step 1 — RESULT: "Bitcoin is $67,432 as of today"
-
-Step 2 — THINK:  "Now I can calculate 0.5 × 67432"
-Step 2 — ACT:    calculator(expression="0.5 * 67432")
-Step 2 — RESULT: "33716.0"
-
-Step 3 — FINAL:  "Bitcoin is $67,432. 0.5 BTC = $33,716 USD."
-```
-
----
-
-## Tech Stack
-
-| Component     | Technology                           |
-|---------------|--------------------------------------|
-| Language      | Python 3.11                          |
-| LLM           | Anthropic Claude API (tool_use)      |
-| API           | FastAPI + SSE (Server-Sent Events)   |
-| Short Memory  | Redis (conversation history)         |
-| Long Memory   | ChromaDB (semantic vector store)     |
-| Container     | Docker + docker-compose              |
-| Validation    | Pydantic v2                          |
-
----
-
-## Project Structure
-
-```
-ai-agent/
-├── agent/
-│   ├── __init__.py
-│   ├── core.py            # Main agent loop (ReAct pattern)
-│   ├── planner.py         # LLM interaction, tool selection
-│   ├── memory.py          # Short-term (Redis) + Long-term (ChromaDB)
-│   └── tool_router.py     # Tool registry and dispatcher
-├── tools/
-│   ├── __init__.py
-│   ├── base.py            # Abstract BaseTool + ToolResult
-│   ├── web_search.py      # DuckDuckGo web search
-│   ├── code_executor.py   # Sandboxed Python execution
-│   ├── file_tool.py       # Safe file read/write
-│   └── calculator.py      # Math expression evaluator
-├── api/
-│   ├── __init__.py
-│   └── main.py            # FastAPI app with SSE streaming
-├── tests/
-│   ├── test_tools.py      # Tool unit tests
-│   ├── test_agent.py      # Agent core tests
-│   └── test_memory.py     # Memory tests
-├── .env                   # Environment variables
-├── .gitignore
-├── Dockerfile
-├── docker-compose.yml
-├── requirements.txt
-└── README.md
+    C->>A: POST /run {goal, session_id}
+    A-->>C: event: run_started
+    A->>M: load session history + recall similar past goals
+    loop until answer or max_iterations
+        A->>L: system + history + tool schemas
+        L-->>A: thinking + text + tool_use blocks
+        alt Claude wants tools
+            A->>T: run every tool_use concurrently
+            T-->>A: results (errors flagged is_error)
+            A->>M: append assistant turn + one tool_result message
+            A-->>C: event: step
+        else final answer
+            A->>M: store goal → answer for future recall
+            A-->>C: event: final
+        end
+    end
 ```
 
----
+## Design decisions
 
-## Quick Start
+| Decision | Why |
+|---|---|
+| **Assistant turns are replayed verbatim** (thinking, text and `tool_use` blocks stored as JSON objects) | The API needs real `tool_use` blocks to pair with `tool_result`s, and thinking blocks must be passed back unchanged. Storing them as a string would make Claude read its own tool calls as plain text. |
+| **All tool calls of a turn run concurrently; results go back in one user message** | Claude can request several tools at once. Splitting results across messages breaks the pairing and teaches the model to stop parallelising. |
+| **History is trimmed at turn boundaries** | Redis `LTRIM` keeps the last N messages, which can orphan a `tool_result`. The API view always starts at a real user message. |
+| **Async end-to-end** (`AsyncAnthropic`, `redis.asyncio`, async SQLAlchemy) and blocking tools/Chroma on worker threads | One slow tool or search must not stall every other stream on the server. |
+| **Postgres is optional** (`NullRunStore` when `DATABASE_URL` is unset) | The agent runs locally with only Redis; history is an add-on, not a dependency of the loop. |
+| **Stable, cache-friendly prompt** — no timestamps or IDs in the system prompt, tools sorted by name, `cache_control` on the system block | Prompt caching is a prefix match; any per-request byte in the prefix would invalidate it. |
+| **Adaptive thinking + `effort`**, server-side refusal fallback (beta) | Lets the model decide how much to think per step; `LLM_EFFORT` trades depth for cost. Fallbacks can be switched off with `LLM_FALLBACKS=false`. |
+| **Failures become data, not exceptions** | Tool errors are returned to Claude with `is_error: true` so it can recover; API errors end the run with a clear status that is persisted. |
 
-### 1. Clone and Configure
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| LLM | Anthropic Claude API — tool use, adaptive thinking, prompt caching |
+| API | FastAPI, Server-Sent Events (`sse-starlette`), Pydantic v2 / pydantic-settings |
+| Short-term memory | Redis (`redis.asyncio`) — per-session history with TTL, rate limiting |
+| Long-term memory | ChromaDB — cosine similarity over past goal/answer pairs |
+| Persistence | PostgreSQL, SQLAlchemy 2 (async, `asyncpg`), Alembic migrations |
+| Quality | pytest (+ fakeredis, aiosqlite), ruff, pre-commit, gitleaks |
+| Delivery | Docker (multi-stage, non-root, read-only FS), docker compose, GitHub Actions, Dependabot |
+
+## Quick start
+
+### With Docker (recommended)
 
 ```bash
-git clone https://github.com/your-username/ai-agent.git
+git clone https://github.com/samandar-hamrayev/ai-agent.git
 cd ai-agent
-cp .env.example .env
+cp .env.example .env          # set ANTHROPIC_API_KEY and POSTGRES_PASSWORD
+docker compose up --build -d
 ```
 
-Edit `.env` and set your Anthropic API key:
-```env
-ANTHROPIC_API_KEY=sk-ant-your-key-here
-```
+Open **http://localhost:8000** for the live demo UI, or **http://localhost:8000/docs** for the OpenAPI docs.
+Migrations run automatically on start.
 
-### 2. Run with Docker
+### Locally
 
 ```bash
-docker-compose up --build
+make install                  # .venv + dev dependencies + pre-commit hooks
+docker compose up -d redis postgres
+make migrate
+make run                      # uvicorn with --reload on :8000
 ```
 
-This starts:
-- **Redis** on port 6379 (short-term memory)
-- **PostgreSQL** on port 5432 (logs)
-- **Agent API** on port 8000
+## API
 
-### 3. Run Locally (Development)
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/run` | Run the agent; streams `run_started` → `step`* → `final` (or `error`) |
+| `GET` | `/runs?session_id=&limit=` | Recent runs |
+| `GET` | `/runs/{run_id}` | A run with all of its steps and tool calls |
+| `DELETE` | `/sessions/{session_id}` | Forget a session's conversation |
+| `GET` | `/tools` | Registered tools and their JSON schemas |
+| `GET` | `/health` | Redis / Postgres status |
 
 ```bash
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-# Start Redis (required)
-docker run -d -p 6379:6379 redis:7-alpine
-
-# Start the API
-uvicorn api.main:app --reload --port 8000
+curl -N -X POST localhost:8000/run \
+  -H 'Content-Type: application/json' \
+  -d '{"goal": "What is (17*23) + 4**5?", "session_id": "demo"}'
 ```
 
----
+```text
+event: run_started
+data: {"run_id": "6f1c…", "session_id": "demo"}
 
-## API Usage
+event: step
+data: {"step_number": 1, "thought": "I'll compute this.", "actions": [{"tool_name": "calculator",
+       "tool_input": {"expression": "(17*23) + 4**5"}, "success": true, "result": "SUCCESS: 1415"}], …}
 
-### Health Check
-
-```bash
-curl http://localhost:8000/health
+event: final
+data: {"step_number": 2, "is_final": true, "final_answer": "(17×23) + 4⁵ = 1415.", …}
 ```
 
-```json
-{
-  "status": "ok",
-  "agent_ready": true,
-  "tools": ["calculator", "code_executor", "file_tool", "web_search"]
-}
-```
+Reuse the same `session_id` to continue a conversation; set `API_KEY` to require an `X-API-Key` header.
 
-### List Tools
+## Configuration
 
-```bash
-curl http://localhost:8000/tools
-```
+All settings are environment variables (see [`.env.example`](.env.example)).
 
-### Run Agent (SSE Stream)
+| Variable | Default | Purpose |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | — | Claude API key |
+| `LLM_MODEL` | `claude-opus-5` | Model ID |
+| `LLM_EFFORT` | `high` | `low` · `medium` · `high` · `xhigh` · `max` |
+| `LLM_FALLBACKS` | `true` | Server-side refusal fallback (beta) |
+| `MAX_ITERATIONS` | `10` | ReAct iteration budget per run |
+| `REDIS_URL` | `redis://localhost:6379/0` | Conversation memory + rate limiter |
+| `DATABASE_URL` | unset | Enables run history (`postgresql+asyncpg://…`) |
+| `ENABLE_CODE_EXECUTOR` | `false` | Registers the Python execution tool |
+| `API_KEY` | unset | Require `X-API-Key` on every request |
+| `RATE_LIMIT_PER_MINUTE` | `20` | Per client, `0` disables |
+| `CORS_ORIGINS` | `["http://localhost:8000"]` | Allowed browser origins |
 
-```bash
-curl -N -X POST http://localhost:8000/run \
-  -H "Content-Type: application/json" \
-  -d '{"goal": "What is 25 * 4 + 100?"}'
-```
+## Tools
 
-Each SSE event contains an `AgentStep`:
-```json
-{
-  "step_number": 1,
-  "thought": "I need to calculate this expression.",
-  "tool_name": "calculator",
-  "tool_input": {"expression": "25 * 4 + 100"},
-  "tool_result": "SUCCESS: 200",
-  "is_final": false,
-  "timestamp": "2025-01-01T00:00:00Z"
-}
-```
+| Tool | What it does | Safety |
+|---|---|---|
+| `calculator` | Arithmetic via an AST walker | No `eval`; exponent capped |
+| `web_search` | DuckDuckGo HTML results (no API key) | 15 s timeout, top 5 results |
+| `file_tool` | Read/write text files | Confined to `WORKSPACE_DIR`; `..`, absolute paths, sibling-prefix dirs and symlink escapes are rejected |
+| `code_executor` | Runs a Python script | Opt-in; see below |
 
-With session continuity:
-```bash
-curl -N -X POST http://localhost:8000/run \
-  -H "Content-Type: application/json" \
-  -d '{"goal": "Write a Python script that prints fibonacci numbers", "session_id": "my-session-123"}'
-```
+Adding a tool means subclassing `BaseTool` (name, description, JSON schema, `run`) and registering it — the
+registry turns it into a Claude tool definition.
 
----
+## Security model
 
-## Available Tools
-
-### 🔢 Calculator (`calculator`)
-Safely evaluates math expressions using AST parsing. No `eval()` or `exec()`.
-
-**Supports:** `+`, `-`, `*`, `/`, `//`, `%`, `**`, parentheses
-
-```json
-{"expression": "(25 * 4) + 100"}
-```
-
-### 🔍 Web Search (`web_search`)
-Searches the web via DuckDuckGo. No API key required.
-
-```json
-{"query": "Python 3.12 new features"}
-```
-
-### 💻 Code Executor (`code_executor`)
-Runs Python code in an isolated subprocess with a 10-second timeout.
-
-```json
-{"code": "print(sum(range(100)))"}
-```
-
-### 📁 File Tool (`file_tool`)
-Reads and writes files within `/tmp/agent_workspace/` (sandboxed).
-
-```json
-{"action": "write", "path": "notes.txt", "content": "Hello!"}
-{"action": "read", "path": "notes.txt"}
-```
-
----
-
-## How to Add a Custom Tool
-
-Create a new file in `tools/` that extends `BaseTool`:
-
-```python
-from tools.base import BaseTool, ToolResult
-
-
-class MyCustomTool(BaseTool):
-    name: str = "my_tool"
-    description: str = "Does something useful."
-
-    def run(self, input_param: str) -> ToolResult:
-        # Your logic here
-        result = f"Processed: {input_param}"
-        return ToolResult(success=True, output=result)
-
-    def get_input_schema(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "input_param": {
-                    "type": "string",
-                    "description": "The input to process.",
-                }
-            },
-            "required": ["input_param"],
-        }
-```
-
-Then register it in `api/main.py`:
-```python
-from tools.my_tool import MyCustomTool
-
-registry.register(MyCustomTool())
-```
-
----
+- **Secrets** come only from the environment; `.env` is git- and docker-ignored; gitleaks runs in pre-commit and CI.
+- **Container**: non-root user, read-only root filesystem, `no-new-privileges`, all Linux capabilities dropped.
+- **API**: optional API key (constant-time comparison), per-client rate limit in Redis, restricted CORS, input validation on goal and session id.
+- **Code execution is defence in depth, not a sandbox.** The child process gets an empty environment, isolated mode (`-I -S`: no site-packages), a throwaway directory and rlimits on CPU, memory, file size and open files. It still runs as the same OS user as the API, so a determined script could read that process's memory or `/proc`. That's why it is **off by default**; a production deployment would run it in a separate, network-less container (gVisor / Firecracker) or use Anthropic's server-side code execution tool.
 
 ## Testing
 
 ```bash
-# Run all tests (no external services needed for most)
-python -m pytest tests/ -v
-
-# Skip slow/network tests
-python -m pytest tests/ -v -m "not slow and not network"
-
-# Run specific test file
-python -m pytest tests/test_tools.py -v
+make test        # fast suite: no network, no embedding model download
+make test-all    # + ChromaDB integration tests
+make lint
 ```
 
----
+The suite (85 tests) drives the full loop with a scripted planner, real Redis semantics (fakeredis), a real
+SQL store (SQLite), and the HTTP layer through `httpx.ASGITransport`. CI also runs Alembic
+upgrade → downgrade → upgrade against PostgreSQL, builds the Docker image and scans history for secrets.
 
-## Security
+## Project structure
 
-- **Code executor** runs in a subprocess with timeout — never uses `eval()`
-- **File tool** restricted to `/tmp/agent_workspace/` — directory traversal blocked
-- **Calculator** uses AST parsing — no arbitrary code execution
-- **API keys** never logged or exposed in responses
-- **Input validation** via Pydantic on all endpoints
+```text
+agent/
+  config.py        settings (pydantic-settings)
+  core.py          ReAct loop, steps, tool-result plumbing
+  planner.py       Claude request building + response parsing
+  memory.py        Redis short-term + ChromaDB long-term memory
+  storage.py       SQLAlchemy models and run store
+  tool_router.py   tool registry, concurrent execution
+api/
+  main.py          FastAPI app factory, SSE endpoint, auth, rate limit
+  static/          zero-dependency demo UI
+tools/             calculator, web_search, file_tool, code_executor
+alembic/           migrations
+tests/             unit + API tests
+```
 
----
+## Roadmap
 
-## Memory System
-
-### Short-Term Memory (Redis)
-- Stores conversation history per session
-- Key: `agent:session:{session_id}:messages`
-- TTL: 1 hour (configurable)
-- Auto-trimmed to last 50 messages
-
-### Long-Term Memory (ChromaDB)
-- Stores important facts as vector embeddings
-- Semantic search across all past sessions
-- Automatically saves goal-answer pairs
-- Injected into system prompt for context
-
----
+- [ ] Stream Claude's text token-by-token inside a step
+- [ ] Per-tool timeouts and an approval hook for side-effecting tools
+- [ ] Token/cost accounting per run (`usage` → Postgres)
+- [ ] Run `code_executor` in a dedicated sandbox container
 
 ## License
 
-MIT
+[MIT](LICENSE) © Samandar Hamrayev
